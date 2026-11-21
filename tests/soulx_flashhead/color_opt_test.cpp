@@ -5,8 +5,10 @@
 #include "engine/models/soulx_flashhead/color.h"
 #include "engine/models/soulx_flashhead/exec_plan.h"
 #include "color_fused.h"
+#include "color_metal_shader.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -242,9 +244,40 @@ void check_metal_float_row(const std::vector<float> & row, const char * name) {
         throw std::runtime_error(std::string(name) + " metal float row stats diverged from the double sum");
 }
 
-void check_metal_float_rows() {
-    if (engine::models::soulx_flashhead::kMetalStatsLanes != 256)
+bool has_identifier(const std::string & source, const std::string & word) {
+    std::size_t pos = 0;
+    while ((pos = source.find(word, pos)) != std::string::npos) {
+        const bool left = pos == 0 ||
+                          (std::isalnum(static_cast<unsigned char>(source[pos - 1])) == 0 && source[pos - 1] != '_');
+        const std::size_t end = pos + word.size();
+        const bool right = end >= source.size() ||
+                           (std::isalnum(static_cast<unsigned char>(source[end])) == 0 && source[end] != '_');
+        if (left && right)
+            return true;
+        pos = end;
+    }
+    return false;
+}
+
+void check_metal_shader_source() {
+    namespace fh = engine::models::soulx_flashhead;
+    if (fh::kMetalStatsLanes != 256)
         throw std::runtime_error("Metal stats lane count drifted from the shader");
+    const std::string source(fh::kFlashHeadColorMetalShader);
+    if (source.find("#pragma METAL fp math_mode(safe)") == std::string::npos ||
+        source.find("#pragma METAL fp contract(off)") == std::string::npos ||
+        source.find("#pragma STDC FP_CONTRACT OFF") == std::string::npos)
+        throw std::runtime_error("Metal shader is missing the strict floating-point pragmas");
+    if (source.find("kahan_add") == std::string::npos || source.find("two_sum") == std::string::npos ||
+        source.find("256u") == std::string::npos)
+        throw std::runtime_error("Metal shader stats kernel does not match the 256-lane float reduction");
+    if (has_identifier(source, "double") || has_identifier(source, "long"))
+        throw std::runtime_error("Metal shader source contains a 64-bit scalar type");
+    std::cout << "metal shader source is float-only with contract off\n";
+    std::cout << "this check reads the shader text; it does not compile or run MSL\n";
+}
+
+void check_metal_float_rows() {
     check_metal_float_row(std::vector<float>(1, 0.25F), "n1");
     check_metal_float_row(std::vector<float>(35, -0.5F), "constant-35");
     check_metal_float_row(std::vector<float>(256, 0.2F), "constant-256");
@@ -415,6 +448,7 @@ int main(int argc, char ** argv) {
         if (!log_path.empty())
             engine::debug::configure_logging({true, log_path});
         check_exec();
+        check_metal_shader_source();
         check_metal_float_rows();
         engine::core::BackendConfig config;
         config.type = backend;

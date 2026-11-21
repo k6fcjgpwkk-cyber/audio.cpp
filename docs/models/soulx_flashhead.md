@@ -219,10 +219,11 @@ back. No other request option changes.
 
 Metal Shading Language 4.1, section 2.1, does not include `double`, `long double`,
 or any 64-bit floating-point type. The fused Metal shader uses `float` only.
-The host compiles it with fast math disabled (`MTLCompileOptions.fastMathEnabled
-= NO`, and `mathMode = Safe` on macOS 15 and later). Fast math is the MSL default
-and may reassociate additions (specification section 1.6.3), which would change
-the compensated sum.
+On a macOS 15 SDK the host sets `MTLMathModeSafe` and
+`MTLMathFloatingPointFunctionsPrecise`. That is the MSL 1.6.3 meaning of
+`-fno-fast-math`. The deprecated `fastMathEnabled` property is left unset on
+that SDK. The shader source also requests `math_mode(safe)` and `contract(off)`.
+An older SDK falls back to `fastMathEnabled = NO`.
 
 The CPU fused path still reduces each Lab row with a double sum, matching
 `ggml_mean` on CPU. That path was bitwise identical to the graph in the CPU run

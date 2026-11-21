@@ -1489,6 +1489,7 @@ if (TARGET engine_model_soulx_flashhead)
         target_sources(engine_model_soulx_flashhead PRIVATE src/models/soulx_flashhead/color_metal.mm)
         target_compile_definitions(engine_model_soulx_flashhead PRIVATE SOULX_FLASHHEAD_COLOR_METAL=1)
         target_include_directories(engine_model_soulx_flashhead PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/external/ggml/src"
             "${CMAKE_CURRENT_SOURCE_DIR}/external/ggml/src/ggml-metal")
         set_source_files_properties(src/models/soulx_flashhead/color_metal.mm PROPERTIES
             COMPILE_FLAGS "-fno-objc-arc")
