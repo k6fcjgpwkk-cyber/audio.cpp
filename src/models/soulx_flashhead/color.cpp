@@ -1,5 +1,9 @@
 #include "engine/models/soulx_flashhead/color.h"
+#include "color_fused.h"
 #include "graph.h"
+#include "engine/framework/debug/trace.h"
+#include <ggml-backend.h>
+#include <algorithm>
 #include <array>
 #include <tuple>
 
@@ -164,17 +168,99 @@ class ColorGraph final : public Graph {
     }
 };
 } // namespace
+struct DeviceSlot {
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx{nullptr, ggml_free};
+    ggml_backend_buffer_t buffer = nullptr;
+    TensorValue video;
+    TensorValue motion;
+    TensorValue lab;
+    TensorValue portrait;
+    TensorValue portrait_lab;
+    TensorValue stats;
+    TensorValue portrait_stats;
+    DeviceSlot() = default;
+    DeviceSlot(const DeviceSlot &) = delete;
+    DeviceSlot & operator=(const DeviceSlot &) = delete;
+    ~DeviceSlot() {
+        if (buffer != nullptr)
+            ggml_backend_buffer_free(buffer);
+    }
+};
+
+TensorValue tensor_4d(ggml_context * ctx, int64_t channels, int64_t frames, int64_t height, int64_t width) {
+    auto * tensor = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, width, height, frames, channels);
+    if (tensor == nullptr)
+        throw std::runtime_error("FlashHead fused color cannot allocate a tensor descriptor");
+    return core::wrap_tensor(tensor, TensorShape::from_dims({channels, frames, height, width}), GGML_TYPE_F32);
+}
+
+TensorValue tensor_1d(ggml_context * ctx, int64_t count) {
+    auto * tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, count);
+    if (tensor == nullptr)
+        throw std::runtime_error("FlashHead fused color cannot allocate a tensor descriptor");
+    return core::wrap_tensor(tensor, TensorShape::from_dims({count}), GGML_TYPE_F32);
+}
+
 struct ColorMatcher::State {
     core::ExecutionContext & execution;
+    ColorMatcherConfig config;
+    int threads = 1;
     std::map<std::tuple<int64_t, int64_t, int64_t, bool>, std::unique_ptr<ColorGraph>> graphs;
-    explicit State(core::ExecutionContext & execution) : execution(execution) {}
+    std::map<std::tuple<int64_t, int64_t, int64_t>, std::unique_ptr<DeviceSlot>> slots;
+    ColorReferenceCache reference;
+    std::vector<float> fused_video;
+    explicit State(core::ExecutionContext & execution, ColorMatcherConfig config)
+        : execution(execution), config(config),
+          threads(config.threads > 0 ? config.threads : std::max(1, execution.config().threads)) {}
+
+    DeviceSlot & slot(int64_t height, int64_t width, int64_t motion_frames) {
+        const int64_t frames = 33 - motion_frames;
+        auto & found = slots[{height, width, motion_frames}];
+        if (found)
+            return *found;
+        found = std::make_unique<DeviceSlot>();
+        auto & device = *found;
+        device.ctx.reset(ggml_init({8 * 1024 * 1024, nullptr, true}));
+        if (!device.ctx)
+            throw std::runtime_error("FlashHead fused color cannot allocate tensor metadata");
+        device.video = tensor_4d(device.ctx.get(), 3, frames, height, width);
+        device.motion = tensor_4d(device.ctx.get(), 3, motion_frames, height, width);
+        const bool metal = config.impl == ColorCorrectionImpl::Fused &&
+                           execution.backend_type() == core::BackendType::Metal && color_fused_metal_compiled();
+        if (metal) {
+            const int64_t pixels = height * width;
+            device.lab = tensor_1d(device.ctx.get(), frames * 3 * pixels);
+            device.portrait = tensor_4d(device.ctx.get(), 3, 1, height, width);
+            device.portrait_lab = tensor_1d(device.ctx.get(), 3 * pixels);
+            device.stats = tensor_1d(device.ctx.get(), frames * 6);
+            device.portrait_stats = tensor_1d(device.ctx.get(), 6);
+        }
+        device.buffer = ggml_backend_alloc_ctx_tensors(device.ctx.get(), execution.backend());
+        if (device.buffer == nullptr)
+            throw std::runtime_error("FlashHead fused color cannot allocate backend storage");
+        return device;
+    }
 };
-ColorMatcher::ColorMatcher(core::ExecutionContext & execution) : state_(std::make_unique<State>(execution)) {}
+ColorMatcher::ColorMatcher(core::ExecutionContext & execution)
+    : ColorMatcher(execution, {}) {}
+ColorMatcher::ColorMatcher(core::ExecutionContext & execution, ColorMatcherConfig config)
+    : state_(std::make_unique<State>(execution, config)) {}
 ColorMatcher::~ColorMatcher() = default;
 const std::vector<float> & ColorMatcher::match(const std::vector<float> & video, const std::vector<float> & portrait,
                                                int64_t height, int64_t width, float strength) {
     if (strength == 0)
         return video;
+    if (state_->config.impl == ColorCorrectionImpl::Fused) {
+        const size_t count = static_cast<size_t>(3 * 33 * height * width);
+        if (video.size() != count || portrait.size() != static_cast<size_t>(3 * height * width))
+            throw std::runtime_error("FlashHead fused color host input has the wrong size");
+        state_->fused_video.resize(count);
+        ColorFusedTiming timing;
+        color_fused_apply_cpu(video.data(), portrait.data(), height, width, 0, 33, 0, strength, state_->threads,
+            state_->reference, state_->fused_video.data(), nullptr, timing);
+        return state_->fused_video;
+    }
+    debug::timing_log_scalar("soulx_flashhead.color.impl", std::string_view("graph"));
     auto & graph = state_->graphs[{height, width, 0, true}];
     if (!graph)
         graph = std::make_unique<ColorGraph>(state_->execution, height, width);
@@ -185,6 +271,22 @@ ColorMatchResult ColorMatcher::match_device(const TensorValue & video, const std
     int64_t height, int64_t width, float strength, int64_t motion_frames) {
     if (motion_frames <= 0 || motion_frames > 33 - motion_frames)
         throw std::runtime_error("FlashHead motion tail must fit within the delivered frames");
+    if (state_->config.impl == ColorCorrectionImpl::Fused) {
+        if (video.shape.rank != 4 || video.shape.dims[0] != 3 || video.shape.dims[1] != 33 ||
+            video.shape.dims[2] != height || video.shape.dims[3] != width)
+            throw std::runtime_error("FlashHead fused color device video shape mismatch");
+        if (portrait.size() != static_cast<size_t>(3 * height * width))
+            throw std::runtime_error("FlashHead fused color portrait size mismatch");
+        auto & device = state_->slot(height, width, motion_frames);
+        ColorFusedDeviceBuffers buffers{video.tensor, device.video.tensor, device.motion.tensor, device.lab.tensor,
+            device.portrait.tensor, device.portrait_lab.tensor, device.stats.tensor, device.portrait_stats.tensor};
+        if (!color_fused_execute_device(state_->execution, buffers, portrait.data(), height, width, motion_frames,
+                33 - motion_frames, motion_frames, strength, state_->threads, state_->reference))
+            throw std::runtime_error(
+                "FlashHead fused color supports the CPU and Metal backends; this backend has no fused kernel");
+        return {device.video, device.motion};
+    }
+    debug::timing_log_scalar("soulx_flashhead.color.impl", std::string_view("graph"));
     auto & graph = state_->graphs[{height, width, motion_frames, strength != 0}];
     if (!graph)
         graph = std::make_unique<ColorGraph>(state_->execution, height, width, motion_frames, strength != 0);

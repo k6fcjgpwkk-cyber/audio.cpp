@@ -1,5 +1,6 @@
 #include "engine/models/soulx_flashhead/session.h"
 #include "engine/models/soulx_flashhead/pipeline.h"
+#include "engine/models/soulx_flashhead/exec_plan.h"
 #include "engine/framework/audio/conversion.h"
 #include "engine/framework/runtime/session_base.h"
 #include "engine/framework/runtime/spec_backed_model.h"
@@ -9,18 +10,6 @@
 namespace engine::models::soulx_flashhead {
 namespace {
 constexpr const char * kFamily = "soulx_flashhead";
-bool resolve_vae_cudnn(const runtime::SessionOptions & options, const Assets & assets) {
-    const auto plan = runtime::parse_exec_plan(options.options, "soulx_flashhead.exec_plan",
-        {{"vae", "ggml", {{"ggml", {options.backend.type}, {}, {}},
-                           {"cudnn", {core::BackendType::Cuda}, {}, {}}}}});
-    const auto & vae = plan.at("vae");
-    const bool cudnn = vae.impl == "cudnn";
-    if (cudnn && options.backend.type != core::BackendType::Cuda)
-        throw std::runtime_error("soulx_flashhead.exec_plan.vae: cudnn requires the CUDA session backend");
-    if (cudnn && assets.config.variant != "lite")
-        throw std::runtime_error("soulx_flashhead.exec_plan.vae: cudnn requires the Lite LTX VAE");
-    return cudnn;
-}
 class Session final : public runtime::RuntimeSessionBase,
                       public runtime::IOfflineVoiceTaskSession,
                       public runtime::IStreamingVoiceTaskSession {
@@ -28,7 +17,10 @@ class Session final : public runtime::RuntimeSessionBase,
     Session(runtime::TaskSpec task, runtime::SessionOptions options, std::shared_ptr<const Assets> assets,
             std::shared_ptr<const model_spec::ModelContract> contract)
         : RuntimeSessionBase(options), task_(task), contract_(std::move(contract)),
-          pipeline_(execution_context(), assets, resolve_vae_cudnn(options, *assets)), block_samples_((32 - assets->config.stride[0]) * 16000 / 25),
+          pipeline_(execution_context(), assets,
+              resolve_flashhead_exec(options.options, options.backend.type, assets->config.variant == "lite").vae_cudnn,
+              resolve_flashhead_exec(options.options, options.backend.type, assets->config.variant == "lite").color),
+          block_samples_((32 - assets->config.stride[0]) * 16000 / 25),
           default_steps_(assets->config.variant == "pretrained" ? 20 : 4) {
         runtime::validate_spec_backed_session_options(options, *contract_, kFamily, "SoulX-FlashHead");
         if (task.task != runtime::VoiceTaskKind::AudioGeneration)
