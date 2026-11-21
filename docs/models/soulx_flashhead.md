@@ -241,6 +241,16 @@ at 384 and 512. Per-pixel
 host libm was not measured, because this host has no `metal` compiler and no
 Metal device.
 
+`match()` always runs the CPU double/libm kernel. `match_device()` on Metal runs
+the shader. The test used to require those two buffers to be bitwise identical
+and exited with no delta when they were not. It now prints max abs, RMSE,
+non-finite counts, and the first sample, and scores that pair with the same
+max abs `1e-4` and RMSE `2e-5` gate. On CPU the device and host kernels are the
+same code and must still match bitwise. A Metal device-versus-graph comparison
+is a separate line. The M5 run of `ce2051be` printed max abs 0 for the 1×1
+device-versus-graph tail before the bitwise host check stopped the process.
+384 and 512 on that GPU were not reached.
+
 This host cannot compile the shader. `metal` and `xcrun` are absent. The shader
 source was checked by reading it: the embedded MSL uses `float` and does not
 declare a 64-bit float. That is not a GPU execution.

@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <iomanip>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -29,12 +30,29 @@ constexpr double kRmseGate = 2e-5;
 // It does not execute the shader. Observed max_abs on the images below was 0.
 constexpr double kMetalFloatMaxAbsGate = 1e-4;
 constexpr double kMetalFloatRmseGate = 2e-5;
+static_assert(kMetalFloatMaxAbsGate == kMaxAbsGate, "float replica keeps the same max abs gate");
+static_assert(kMetalFloatRmseGate == kRmseGate, "float replica keeps the same rmse gate");
 
 struct Error {
     double max_abs = 0;
     double rmse = 0;
     int64_t rgb8_mismatch = 0;
     double rgb8_mae = 0;
+    int64_t finite_pairs = 0;
+    int64_t nonfinite_actual = 0;
+    int64_t nonfinite_expected = 0;
+    bool bitwise = false;
+    bool have_sample = false;
+    bool sample_nonfinite = false;
+    size_t sample_index = 0;
+    int64_t sample_c = -1;
+    int64_t sample_frame = -1;
+    int64_t sample_y = -1;
+    int64_t sample_x = -1;
+    float sample_actual = 0;
+    float sample_expected = 0;
+    uint32_t sample_actual_bits = 0;
+    uint32_t sample_expected_bits = 0;
 };
 
 int fail(const std::string & message) {
@@ -78,16 +96,63 @@ std::vector<float> image(int64_t height, int64_t width, uint32_t seed, bool port
     return values;
 }
 
-Error compare(const std::vector<float> & actual, const std::vector<float> & expected) {
+uint32_t float_bits(float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+void note_sample(Error & error, size_t index, float actual, float expected, bool nonfinite, int64_t frames,
+    int64_t height, int64_t width) {
+    if (error.have_sample)
+        return;
+    error.have_sample = true;
+    error.sample_nonfinite = nonfinite;
+    error.sample_index = index;
+    error.sample_actual = actual;
+    error.sample_expected = expected;
+    error.sample_actual_bits = float_bits(actual);
+    error.sample_expected_bits = float_bits(expected);
+    if (frames > 0 && height > 0 && width > 0) {
+        const size_t pixels = static_cast<size_t>(height * width);
+        const size_t plane = static_cast<size_t>(frames) * pixels;
+        if (plane > 0 && index / plane < 3) {
+            error.sample_c = static_cast<int64_t>(index / plane);
+            const size_t rem = index % plane;
+            error.sample_frame = static_cast<int64_t>(rem / pixels);
+            const size_t p = rem % pixels;
+            error.sample_y = static_cast<int64_t>(p / static_cast<size_t>(width));
+            error.sample_x = static_cast<int64_t>(p % static_cast<size_t>(width));
+        }
+    }
+}
+
+Error compare(const std::vector<float> & actual, const std::vector<float> & expected, int64_t frames = 0,
+    int64_t height = 0, int64_t width = 0) {
     if (actual.size() != expected.size())
-        throw std::runtime_error("color output size mismatch");
+        throw std::runtime_error("color output size mismatch actual=" + std::to_string(actual.size()) +
+                                 " expected=" + std::to_string(expected.size()));
     Error error;
+    error.bitwise = actual.size() == expected.size() &&
+                    std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)) == 0;
     double square = 0;
     for (size_t i = 0; i < actual.size(); ++i) {
-        if (!std::isfinite(actual[i]) || !std::isfinite(expected[i]))
-            throw std::runtime_error("non-finite color output");
+        const bool finite_actual = std::isfinite(actual[i]);
+        const bool finite_expected = std::isfinite(expected[i]);
+        if (!finite_actual)
+            ++error.nonfinite_actual;
+        if (!finite_expected)
+            ++error.nonfinite_expected;
+        if (!finite_actual || !finite_expected) {
+            note_sample(error, i, actual[i], expected[i], true, frames, height, width);
+            continue;
+        }
+        ++error.finite_pairs;
         const double delta = static_cast<double>(actual[i]) - static_cast<double>(expected[i]);
-        error.max_abs = std::max(error.max_abs, std::abs(delta));
+        const double abs_delta = std::abs(delta);
+        if (actual[i] != expected[i])
+            note_sample(error, i, actual[i], expected[i], false, frames, height, width);
+        error.max_abs = std::max(error.max_abs, abs_delta);
         square += delta * delta;
         const auto qa = static_cast<int>(std::lround(std::clamp((actual[i] + 1.F) * 127.5F, 0.F, 255.F)));
         const auto qb = static_cast<int>(std::lround(std::clamp((expected[i] + 1.F) * 127.5F, 0.F, 255.F)));
@@ -95,17 +160,38 @@ Error compare(const std::vector<float> & actual, const std::vector<float> & expe
         if (qa != qb)
             ++error.rgb8_mismatch;
     }
-    error.rmse = std::sqrt(square / static_cast<double>(actual.size()));
-    error.rgb8_mae /= static_cast<double>(actual.size());
+    if (error.finite_pairs > 0) {
+        error.rmse = std::sqrt(square / static_cast<double>(error.finite_pairs));
+        error.rgb8_mae /= static_cast<double>(error.finite_pairs);
+    }
     return error;
 }
 
-void require_close(const std::string & name, const Error & error) {
+void print_error(const std::string & name, const Error & error) {
     std::cout << name << " max_abs=" << error.max_abs << " rmse=" << error.rmse
-              << " rgb8_mismatch=" << error.rgb8_mismatch << " rgb8_mae=" << error.rgb8_mae << '\n';
+              << " finite_pairs=" << error.finite_pairs << " nonfinite_actual=" << error.nonfinite_actual
+              << " nonfinite_expected=" << error.nonfinite_expected << " rgb8_mismatch=" << error.rgb8_mismatch
+              << " rgb8_mae=" << error.rgb8_mae << " bitwise=" << (error.bitwise ? 1 : 0);
+    if (error.have_sample) {
+        std::cout << " first_index=" << error.sample_index << " c=" << error.sample_c
+                  << " frame=" << error.sample_frame << " y=" << error.sample_y << " x=" << error.sample_x
+                  << " actual=" << error.sample_actual << " expected=" << error.sample_expected << std::hex
+                  << " actual_bits=0x" << error.sample_actual_bits << " expected_bits=0x" << error.sample_expected_bits
+                  << std::dec << " sample_nonfinite=" << (error.sample_nonfinite ? 1 : 0);
+    }
+    std::cout << '\n';
+}
+
+void require_close(const std::string & name, const Error & error) {
+    print_error(name, error);
+    if (error.nonfinite_actual != 0 || error.nonfinite_expected != 0)
+        throw std::runtime_error(name + " has non-finite samples actual=" + std::to_string(error.nonfinite_actual) +
+                                 " expected=" + std::to_string(error.nonfinite_expected) +
+                                 " max_abs=" + std::to_string(error.max_abs));
     if (error.max_abs > kMaxAbsGate || error.rmse > kRmseGate)
-        throw std::runtime_error(name + " exceeded the CPU numerical gate (max_abs " + std::to_string(kMaxAbsGate) +
-                                 ", rmse " + std::to_string(kRmseGate) + ")");
+        throw std::runtime_error(name + " exceeded the numerical gate max_abs=" + std::to_string(error.max_abs) +
+                                 " rmse=" + std::to_string(error.rmse) + " limit_max_abs=" +
+                                 std::to_string(kMaxAbsGate) + " limit_rmse=" + std::to_string(kRmseGate));
 }
 
 std::vector<float> read_tensor(const ggml_tensor * tensor) {
@@ -154,17 +240,27 @@ void check_shape(engine::core::ExecutionContext & execution, engine::models::sou
             require_close(name + " device tail=" + std::to_string(tail), compare(fused_video, graph_video));
             require_close(name + " motion tail=" + std::to_string(tail), compare(fused_motion, graph_motion));
         }
-        const auto host_again = fused.match(video, portrait, height, width, strength);
+        const auto & host_again = fused.match(video, portrait, height, width, strength);
         if (strength != 0.F) {
-            bool video_match = true;
-            for (size_t c = 0; c < 3 && video_match; ++c) {
-                const float * host = host_again.data() + (c * 33 + static_cast<size_t>(tail)) * pixels;
-                const float * dev = fused_video.data() + c * frames * pixels;
-                if (std::memcmp(host, dev, frames * pixels * sizeof(float)) != 0)
-                    video_match = false;
-            }
-            if (!video_match)
-                throw std::runtime_error(name + " fused device output differs from the fused host window");
+            // Host match() always runs the CPU double/libm kernel. Device match on
+            // Metal runs the shader. Those are not the same bits. CPU device and
+            // host are the same kernel and stay bitwise.
+            if (host_again.size() != 3 * 33 * pixels)
+                throw std::runtime_error(name + " fused host size " + std::to_string(host_again.size()));
+            std::vector<float> host_window(fused_video.size());
+            for (size_t channel = 0; channel < 3; ++channel)
+                std::memcpy(host_window.data() + channel * frames * pixels,
+                    host_again.data() + (channel * 33 + static_cast<size_t>(tail)) * pixels,
+                    frames * pixels * sizeof(float));
+            const char * device_name = execution.backend_type() == engine::core::BackendType::Metal ? "metal-shader"
+                                                                                                    : "cpu-double";
+            const auto window_error = compare(fused_video, host_window, static_cast<int64_t>(frames), height, width);
+            const std::string window_name = name + " tail=" + std::to_string(tail) +
+                                            " fused-device(" + device_name + ") vs fused-host(cpu-double-libm)";
+            require_close(window_name, window_error);
+            if (execution.backend_type() != engine::core::BackendType::Metal && !window_error.bitwise)
+                throw std::runtime_error(window_name + " CPU device and host differ bitwise max_abs=" +
+                                         std::to_string(window_error.max_abs));
         }
     }
 }
@@ -306,13 +402,10 @@ void check_metal_float_color(engine::models::soulx_flashhead::ColorMatcher & gra
     fh::ColorFusedTiming timing;
     fh::color_fused_apply_cpu(video.data(), portrait.data(), height, width, 0, 33, 0, strength, 2, cache, fused.data(),
         nullptr, timing, fh::ColorFusedReduction::MetalFloat);
-    const auto error = compare(fused, graph_host);
-    const std::string name = std::string("metal-f32 ") + label + " " + std::to_string(height) + "x" +
-                             std::to_string(width);
-    std::cout << name << " max_abs=" << error.max_abs << " rmse=" << error.rmse
-              << " rgb8_mismatch=" << error.rgb8_mismatch << " rgb8_mae=" << error.rgb8_mae << '\n';
-    if (error.max_abs > kMetalFloatMaxAbsGate || error.rmse > kMetalFloatRmseGate)
-        throw std::runtime_error(name + " exceeded the Metal-float reduction gate");
+    const auto error = compare(fused, graph_host, 33, height, width);
+    require_close(std::string("metal-f32-replica ") + label + " " + std::to_string(height) + "x" +
+                      std::to_string(width) + " cpu-libm-float-stats vs graph",
+        error);
 }
 
 void check_exec() {
@@ -411,13 +504,10 @@ void bench(engine::core::ExecutionContext & execution, int64_t side) {
     fh::color_fused_apply_cpu(video_copy.data(), portrait.data(), side, side, 0, 33, 0, 1.F, execution.config().threads,
         reference, metal_float.data(), nullptr, timing, fh::ColorFusedReduction::MetalFloat);
     const double metal_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - metal_started).count();
-    const auto metal_error = compare(metal_float, graph.match(video_copy, portrait, side, side, 1.F));
+    const auto metal_error = compare(metal_float, graph.match(video_copy, portrait, side, side, 1.F), 33, side, side);
     std::cout << "bench metal-f32-stats " << side << " cpu_replica_ms=" << metal_ms
-              << " max_abs=" << metal_error.max_abs << " rmse=" << metal_error.rmse
-              << " rgb8_mismatch=" << metal_error.rgb8_mismatch << '\n';
-    std::cout << "metal-f32 bench is the CPU replica of the shader reduction, not a GPU dispatch\n";
-    if (metal_error.max_abs > kMetalFloatMaxAbsGate || metal_error.rmse > kMetalFloatRmseGate)
-        throw std::runtime_error("bench metal float stats exceeded the reduction gate");
+              << " this is the CPU replica of the shader reduction, not a GPU dispatch\n";
+    require_close("bench metal-f32-replica " + std::to_string(side), metal_error);
 }
 
 } // namespace
@@ -483,11 +573,8 @@ int main(int argc, char ** argv) {
             fh::ColorFusedTiming timing;
             fh::color_fused_apply_cpu(video.data(), portrait.data(), height, width, 0, 33, 0, 1.F, 1, cache,
                 fused.data(), nullptr, timing, fh::ColorFusedReduction::MetalFloat);
-            const auto error = compare(fused, graph_host);
-            std::cout << "metal-f32 constant 8x8 max_abs=" << error.max_abs << " rmse=" << error.rmse
-                      << " rgb8_mismatch=" << error.rgb8_mismatch << '\n';
-            if (error.max_abs > kMetalFloatMaxAbsGate || error.rmse > kMetalFloatRmseGate)
-                throw std::runtime_error("constant frame metal float reduction exceeded its gate");
+            const auto error = compare(fused, graph_host, 33, height, width);
+            require_close("metal-f32-replica constant 8x8 cpu-libm-float-stats vs graph", error);
         }
         for (const float strength : {0.F, 0.37F, 1.F}) {
             check_shape(execution, graph, fused, 1, 1, strength);
