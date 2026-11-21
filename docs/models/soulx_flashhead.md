@@ -91,7 +91,7 @@ python tools/models/soulx_flashhead/render_video.py \
 
 | Option | Type / values | Default | Description |
 |---|---|---|---|
-| `soulx_flashhead.exec_plan` | `string` | `{}` | JSON component execution plan. vae.impl is ggml (default) or cudnn. cudnn requires the Lite variant, CUDA backend, and cuDNN Conv3D build support. No artifacts or params are used. |
+| `soulx_flashhead.exec_plan` | `string` | `{}` | JSON component execution plan. vae.impl is ggml (default) or cudnn. cudnn requires the Lite variant, CUDA backend, and cuDNN Conv3D build support. color.impl is graph (default) or fused. fused keeps color correction on. It supports cpu and metal only and is not bit-identical on Metal. No artifacts or params are used. |
 
 ## Convert Lite
 
@@ -198,3 +198,119 @@ For Lite on CUDA, select the optional cuDNN implementation with
 `--session-option 'soulx_flashhead.exec_plan={"vae":{"impl":"cudnn"}}'`.
 This requires the cuDNN Conv3D build option above; an unavailable implementation
 is rejected rather than silently substituted.
+
+## Fused color correction
+
+The default color path is unchanged: `color.impl` omitted or `"graph"` builds the
+existing Lab-transfer graph. Turning `color_correction_strength` off is not an
+optimization. The opt-in fused path keeps correction on and evaluates the same
+transfer (bf16-rounded matrices and white point, the same sRGB and Lab knees,
+per-frame mean and standard deviation, then the strength blend):
+
+```bash
+--session-option 'soulx_flashhead.exec_plan={"color":{"impl":"fused"}}'
+```
+
+`fused` is rejected on CUDA, Vulkan, and HIP. On Metal it requires a macOS build
+with `ENGINE_ENABLE_METAL=ON`. Omit the field, or set `"impl":"graph"`, to roll
+back. No other request option changes.
+
+Stage timings are written to the normal timing log when logging is enabled:
+
+| Key | Meaning |
+|---|---|
+| `soulx_flashhead.color.impl` | `graph`, `fused_cpu`, `fused_metal`, or `fused_copy` (strength 0) |
+| `soulx_flashhead.color.lab_ms` | Fused RGB to Lab, including a cached reference on a miss |
+| `soulx_flashhead.color.stats_ms` | Per-frame mean and standard deviation |
+| `soulx_flashhead.color.match_ms` | Lab match, Lab to RGB, and the strength blend |
+| `soulx_flashhead.color.reference_cached` | `1` when the portrait statistics were reused |
+| `soulx_flashhead.color.wall_ms` | Whole color stage. The graph path reports this too |
+
+The reference portrait statistics are computed once per identical portrait and
+resolution. Video frames are still corrected every chunk. The Lite VAE decode
+and motion encode are unchanged: decode is LTX Conv3D through ggml im2col and
+matmul, with a bf16 round after each convolution and residual. Dropping those
+rounds or switching activations to float16 would change values. This change
+does not do that.
+
+### Portable numerical check
+
+No model weights are required. From a CPU build:
+
+```bash
+cmake -S . -B build/color-opt -DAUDIOCPP_MODEL_SET=custom -DAUDIOCPP_MODELS=soulx_flashhead \
+  -DENGINE_ENABLE_CUDA=OFF -DENGINE_ENABLE_VULKAN=OFF -DENGINE_ENABLE_METAL=OFF \
+  -DENGINE_ENABLE_NATIVE_CPU=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build/color-opt -j"$(nproc)" --target soulx_flashhead_color_opt_test
+./build/color-opt/bin/soulx_flashhead_color_opt_test
+./build/color-opt/bin/soulx_flashhead_color_opt_test --bench 128
+```
+
+The test compares the graph and the fused kernel on edge values (sRGB knee,
+out-of-range samples, a constant frame, a one-pixel spike), non-square sizes,
+strength 0 / 0.37 / 1, and motion tails 9 and 5. Strength 0, a repeated fused
+call, and thread counts 1 and 2 are bitwise identical. For strength greater
+than 0 the regression gate is:
+
+- max absolute error `1e-4` on the `[-1, 1]` samples
+- RMSE `2e-5`
+
+A Release CPU run of this test, gcc 13, 2 threads, native CPU instructions off,
+was bitwise identical (`max_abs=0`, `rmse=0`, no 8-bit mismatches) through 512,
+including the shapes below. That is a CPU result. It is not a Metal result.
+`--bench 384` and `--bench 512` print milliseconds for the process that ran
+them. Do not read them as M5 Ultra frame time.
+
+Warm device calls from that CPU run, 33 input frames and a motion tail of 9:
+
+| Size | Graph | Fused CPU |
+|---|---|---|
+| 384 | 2202 ms | 403 ms |
+| 512 | 3915 ms | 664 ms |
+
+The fused CPU kernel is faster than the CPU graph because it removes the long
+chain of elementwise launches. It is slower than the Metal graph times already
+measured on the M5 Ultra (about 196 ms at 384 and 349 ms at 512 for color
+alone). On Metal the fused path dispatches the GPU shader; it does not run this
+CPU kernel. That shader has not been timed here.
+
+### Isolated Mac build and measurement
+
+Build only this family so the binary stays local to the benchmark. Metal is on
+by default in `scripts/build_metal.sh`:
+
+```bash
+scripts/build_metal.sh --deployment-build --model-set custom --models soulx_flashhead \
+  --target soulx_flashhead_color_opt_test
+./build/macos-metal-release/bin/soulx_flashhead_color_opt_test --backend metal --bench 384 --log /tmp/flashhead-color-384.log
+./build/macos-metal-release/bin/soulx_flashhead_color_opt_test --backend metal --bench 512 --log /tmp/flashhead-color-512.log
+```
+
+`--backend metal` compares the Metal graph with the fused Metal kernel on the
+same synthetic frames (33 input frames, motion tail 9, so 24 delivered frames
+at 384 or 512). The process prints max absolute error, RMSE, 8-bit mismatch
+count, and warm graph versus fused milliseconds. It exits non-zero if the float
+error exceeds the CPU gate above. That gate is intentionally tight for a first
+Mac run: a failure means the shader disagrees with the graph and the fused path
+must stay off. It is not evidence of a speedup.
+
+A full Lite chunk still has to be timed with the GGUF, because this test does
+not run the VAE or DiT:
+
+```bash
+./build/macos-metal-release/bin/audiocpp_cli \
+  --family soulx_flashhead --task gen --backend metal --threads 2 \
+  --model /path/to/SoulX-FlashHead-Lite-Q8_0.gguf \
+  --audio /path/to/speech.wav \
+  --request-option reference_image_file=/path/to/portrait.png \
+  --request-option height=512 --request-option width=512 \
+  --request-option num_inference_steps=2 \
+  --session-option 'soulx_flashhead.exec_plan={"color":{"impl":"fused"}}' \
+  --out-dir /tmp/flashhead-fused --log --log-file /tmp/flashhead-fused.log
+```
+
+Read `soulx_flashhead.color.wall_ms` and `ltx_video_vae.decode.graph.compute_ms`
+from that log. Compare a second run that omits the session option. Rollback is
+that second run. Nothing in this tree records an M5 Ultra delta: the cloud
+build host has no Metal device, so GPU milliseconds, 25 FPS, and the 120-second
+contention profile are unverified until those commands are run on the machine.

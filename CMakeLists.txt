@@ -1455,6 +1455,8 @@ endif()
 audiocpp_add_model(soulx_flashhead
     SOURCES
         src/models/soulx_flashhead/color.cpp
+        src/models/soulx_flashhead/color_fused.cpp
+        src/models/soulx_flashhead/exec_plan.cpp
         src/models/soulx_flashhead/audio.cpp
         src/models/soulx_flashhead/assets.cpp
         src/models/soulx_flashhead/dit.cpp
@@ -1479,6 +1481,16 @@ if (TARGET engine_model_soulx_flashhead)
     target_link_libraries(soulx_flashhead_components PRIVATE engine_runtime ggml)
     add_executable(soulx_flashhead_session_test EXCLUDE_FROM_ALL tests/soulx_flashhead/session_test.cpp)
     target_link_libraries(soulx_flashhead_session_test PRIVATE engine_runtime ggml)
+    add_executable(soulx_flashhead_color_opt_test EXCLUDE_FROM_ALL tests/soulx_flashhead/color_opt_test.cpp)
+    target_link_libraries(soulx_flashhead_color_opt_test PRIVATE engine_runtime ggml)
+    if (APPLE AND ENGINE_ENABLE_METAL)
+        target_sources(engine_model_soulx_flashhead PRIVATE src/models/soulx_flashhead/color_metal.mm)
+        target_compile_definitions(engine_model_soulx_flashhead PRIVATE SOULX_FLASHHEAD_COLOR_METAL=1)
+        target_include_directories(engine_model_soulx_flashhead PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/external/ggml/src/ggml-metal")
+        set_source_files_properties(src/models/soulx_flashhead/color_metal.mm PROPERTIES
+            COMPILE_FLAGS "-fno-objc-arc")
+    endif()
 endif()
 
 audiocpp_add_model(liveavatar
@@ -3286,6 +3298,12 @@ target_include_directories(engine_runtime PRIVATE
 )
 
 target_link_libraries(engine_runtime PUBLIC ggml)
+if (APPLE AND ENGINE_ENABLE_METAL)
+    find_library(AUDIOCPP_METAL_FRAMEWORK Metal REQUIRED)
+    find_library(AUDIOCPP_FOUNDATION_FRAMEWORK Foundation REQUIRED)
+    target_link_libraries(engine_runtime PUBLIC
+        ggml-metal ${AUDIOCPP_METAL_FRAMEWORK} ${AUDIOCPP_FOUNDATION_FRAMEWORK})
+endif()
 find_package(Threads REQUIRED)
 target_link_libraries(engine_runtime PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
 target_link_libraries(engine_runtime PRIVATE sentencepiece cjson_vendor yaml_vendor)

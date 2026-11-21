@@ -88,7 +88,7 @@
       {
         "name": "exec_plan",
         "type": "string",
-        "description": "JSON component execution plan. vae.impl is ggml (default) or cudnn. cudnn requires the Lite variant, CUDA backend, and cuDNN Conv3D build support. No artifacts or params are used.",
+        "description": "JSON component execution plan. vae.impl is ggml (default) or cudnn. cudnn requires the Lite variant, CUDA backend, and cuDNN Conv3D build support. color.impl is graph (default) or fused. fused keeps color correction enabled and evaluates the same Lab transfer in fewer passes. It is opt-in: Metal log/exp is not bit-identical to the graph. fused supports the cpu and metal backends only. No artifacts or params are used.",
         "required": false,
         "default": "{}"
       }

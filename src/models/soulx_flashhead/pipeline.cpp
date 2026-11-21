@@ -25,9 +25,10 @@ struct Pipeline::State {
     int64_t index = 0;
     bool active = false;
     sampling::TorchCudaSamplingPolicy random_policy;
-    State(core::ExecutionContext & execution, std::shared_ptr<const Assets> assets, bool cuda_cudnn)
+    State(core::ExecutionContext & execution, std::shared_ptr<const Assets> assets, bool cuda_cudnn,
+        ColorCorrectionImpl color_impl)
         : execution(execution), assets(std::move(assets)), dit(execution, *this->assets), vae(execution, *this->assets, cuda_cudnn),
-          audio(execution.config(), *this->assets), colors(execution) {
+          audio(execution.config(), *this->assets), colors(execution, ColorMatcherConfig{color_impl}) {
         core::set_backend_round_bf16_fusion(execution.backend(), true);
         random_policy = sampling::resolve_torch_cuda_sampling_policy(
             execution.backend_type(), execution.config().device, "soulx_flashhead", "SoulX-FlashHead");
@@ -156,8 +157,9 @@ struct Pipeline::State {
         return out;
     }
 };
-Pipeline::Pipeline(core::ExecutionContext & execution, std::shared_ptr<const Assets> assets, bool cuda_cudnn)
-    : state_(std::make_unique<State>(execution, std::move(assets), cuda_cudnn)) {}
+Pipeline::Pipeline(core::ExecutionContext & execution, std::shared_ptr<const Assets> assets, bool cuda_cudnn,
+    ColorCorrectionImpl color)
+    : state_(std::make_unique<State>(execution, std::move(assets), cuda_cudnn, color)) {}
 Pipeline::~Pipeline() = default;
 void Pipeline::begin(const GenerateOptions & options) {
     reset();

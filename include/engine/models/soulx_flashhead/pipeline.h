@@ -1,5 +1,6 @@
 #pragma once
 #include "engine/models/soulx_flashhead/assets.h"
+#include "engine/models/soulx_flashhead/color.h"
 #include "engine/framework/core/execution_context.h"
 #include <cstddef>
 
@@ -16,7 +17,8 @@ struct VideoChunk {
 };
 class Pipeline {
   public:
-    Pipeline(core::ExecutionContext & execution, std::shared_ptr<const Assets> assets, bool cuda_cudnn = false);
+    Pipeline(core::ExecutionContext & execution, std::shared_ptr<const Assets> assets, bool cuda_cudnn = false,
+        ColorCorrectionImpl color = ColorCorrectionImpl::Graph);
     ~Pipeline();
     void begin(const GenerateOptions & options);
     std::vector<VideoChunk> push(const std::vector<float> & mono16k, bool final);
