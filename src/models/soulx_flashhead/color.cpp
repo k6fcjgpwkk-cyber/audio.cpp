@@ -176,6 +176,8 @@ struct DeviceSlot {
     TensorValue lab;
     TensorValue portrait;
     TensorValue portrait_lab;
+    TensorValue stats;
+    TensorValue portrait_stats;
     DeviceSlot() = default;
     DeviceSlot(const DeviceSlot &) = delete;
     DeviceSlot & operator=(const DeviceSlot &) = delete;
@@ -230,6 +232,8 @@ struct ColorMatcher::State {
             device.lab = tensor_1d(device.ctx.get(), frames * 3 * pixels);
             device.portrait = tensor_4d(device.ctx.get(), 3, 1, height, width);
             device.portrait_lab = tensor_1d(device.ctx.get(), 3 * pixels);
+            device.stats = tensor_1d(device.ctx.get(), frames * 6);
+            device.portrait_stats = tensor_1d(device.ctx.get(), 6);
         }
         device.buffer = ggml_backend_alloc_ctx_tensors(device.ctx.get(), execution.backend());
         if (device.buffer == nullptr)
@@ -275,7 +279,7 @@ ColorMatchResult ColorMatcher::match_device(const TensorValue & video, const std
             throw std::runtime_error("FlashHead fused color portrait size mismatch");
         auto & device = state_->slot(height, width, motion_frames);
         ColorFusedDeviceBuffers buffers{video.tensor, device.video.tensor, device.motion.tensor, device.lab.tensor,
-            device.portrait.tensor, device.portrait_lab.tensor};
+            device.portrait.tensor, device.portrait_lab.tensor, device.stats.tensor, device.portrait_stats.tensor};
         if (!color_fused_execute_device(state_->execution, buffers, portrait.data(), height, width, motion_frames,
                 33 - motion_frames, motion_frames, strength, state_->threads, state_->reference))
             throw std::runtime_error(

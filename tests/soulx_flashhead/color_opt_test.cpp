@@ -4,6 +4,7 @@
 #include "engine/framework/debug/trace.h"
 #include "engine/models/soulx_flashhead/color.h"
 #include "engine/models/soulx_flashhead/exec_plan.h"
+#include "color_fused.h"
 
 #include <algorithm>
 #include <chrono>
@@ -21,6 +22,11 @@ namespace {
 // covered by these gates. They are not a Metal measurement.
 constexpr double kMaxAbsGate = 1e-4;
 constexpr double kRmseGate = 2e-5;
+// CPU graph versus the float Kahan/two-sum reduction implemented by the Metal
+// stats kernel. The comparison uses the CPU replica and libm per-pixel math.
+// It does not execute the shader. Observed max_abs on the images below was 0.
+constexpr double kMetalFloatMaxAbsGate = 1e-4;
+constexpr double kMetalFloatRmseGate = 2e-5;
 
 struct Error {
     double max_abs = 0;
@@ -213,6 +219,69 @@ void check_motion_rejection(engine::models::soulx_flashhead::ColorMatcher & matc
         throw std::runtime_error("oversized motion tail was accepted");
 }
 
+void check_metal_float_row(const std::vector<float> & row, const char * name) {
+    const auto metal = engine::models::soulx_flashhead::color_fused_metal_f32_row(row.data(),
+        static_cast<int64_t>(row.size()));
+    double sum = 0;
+    for (float value : row)
+        sum += static_cast<double>(value);
+    const float mean = static_cast<float>(sum) / static_cast<float>(row.size());
+    double squares = 0;
+    for (float value : row) {
+        const float delta = value - mean;
+        squares += static_cast<double>(delta * delta);
+    }
+    const float stddev = std::sqrt(static_cast<float>(squares) / static_cast<float>(row.size()));
+    const double mean_abs = std::abs(static_cast<double>(metal.mean) - mean);
+    const double std_abs = std::abs(static_cast<double>(metal.stddev) - static_cast<double>(stddev));
+    std::cout << "metal-f32 row " << name << " n=" << row.size() << " mean_abs=" << mean_abs
+              << " std_abs=" << std_abs << " metal_std=" << metal.stddev << " double_std=" << stddev << '\n';
+    if (!std::isfinite(metal.mean) || !std::isfinite(metal.stddev))
+        throw std::runtime_error(std::string(name) + " metal float stats were non-finite");
+    if (mean_abs > 1e-4 || std_abs > 1e-4)
+        throw std::runtime_error(std::string(name) + " metal float row stats diverged from the double sum");
+}
+
+void check_metal_float_rows() {
+    if (engine::models::soulx_flashhead::kMetalStatsLanes != 256)
+        throw std::runtime_error("Metal stats lane count drifted from the shader");
+    check_metal_float_row(std::vector<float>(1, 0.25F), "n1");
+    check_metal_float_row(std::vector<float>(35, -0.5F), "constant-35");
+    check_metal_float_row(std::vector<float>(256, 0.2F), "constant-256");
+    check_metal_float_row(std::vector<float>(257, 0.2F), "constant-257");
+    check_metal_float_row(std::vector<float>(147456, 0.2F), "constant-384sq");
+    check_metal_float_row(std::vector<float>(262144, -1.25F), "constant-512sq");
+    std::vector<float> spike(262144, 0.F);
+    spike[1000] = 4.F;
+    spike[262143] = -3.F;
+    check_metal_float_row(spike, "spike-512sq");
+    std::vector<float> random(147456);
+    uint32_t state = 99;
+    for (float & value : random)
+        value = unit(state) * 80.F - 40.F;
+    check_metal_float_row(random, "random-lab-384sq");
+}
+
+void check_metal_float_color(engine::models::soulx_flashhead::ColorMatcher & graph, int64_t height, int64_t width,
+    float strength, uint32_t seed, const char * label) {
+    namespace fh = engine::models::soulx_flashhead;
+    const auto video = image(height, width, seed, false);
+    const auto portrait = image(height, width, seed + 17, true);
+    const auto & graph_host = graph.match(video, portrait, height, width, strength);
+    std::vector<float> fused(video.size());
+    fh::ColorReferenceCache cache;
+    fh::ColorFusedTiming timing;
+    fh::color_fused_apply_cpu(video.data(), portrait.data(), height, width, 0, 33, 0, strength, 2, cache, fused.data(),
+        nullptr, timing, fh::ColorFusedReduction::MetalFloat);
+    const auto error = compare(fused, graph_host);
+    const std::string name = std::string("metal-f32 ") + label + " " + std::to_string(height) + "x" +
+                             std::to_string(width);
+    std::cout << name << " max_abs=" << error.max_abs << " rmse=" << error.rmse
+              << " rgb8_mismatch=" << error.rgb8_mismatch << " rgb8_mae=" << error.rgb8_mae << '\n';
+    if (error.max_abs > kMetalFloatMaxAbsGate || error.rmse > kMetalFloatRmseGate)
+        throw std::runtime_error(name + " exceeded the Metal-float reduction gate");
+}
+
 void check_exec() {
     namespace fh = engine::models::soulx_flashhead;
     const auto base = fh::resolve_flashhead_exec({}, engine::core::BackendType::Cpu, true);
@@ -301,6 +370,21 @@ void bench(engine::core::ExecutionContext & execution, int64_t side) {
               << " rmse=" << error.rmse << " rgb8_mismatch=" << error.rgb8_mismatch << '\n';
     std::cout << "bench timings are for this process only; they are not an M5 Ultra measurement\n";
     require_close("bench " + std::to_string(side), error);
+    const auto video_copy = video;
+    std::vector<float> metal_float(video.size());
+    fh::ColorReferenceCache reference;
+    fh::ColorFusedTiming timing;
+    const auto metal_started = std::chrono::steady_clock::now();
+    fh::color_fused_apply_cpu(video_copy.data(), portrait.data(), side, side, 0, 33, 0, 1.F, execution.config().threads,
+        reference, metal_float.data(), nullptr, timing, fh::ColorFusedReduction::MetalFloat);
+    const double metal_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - metal_started).count();
+    const auto metal_error = compare(metal_float, graph.match(video_copy, portrait, side, side, 1.F));
+    std::cout << "bench metal-f32-stats " << side << " cpu_replica_ms=" << metal_ms
+              << " max_abs=" << metal_error.max_abs << " rmse=" << metal_error.rmse
+              << " rgb8_mismatch=" << metal_error.rgb8_mismatch << '\n';
+    std::cout << "metal-f32 bench is the CPU replica of the shader reduction, not a GPU dispatch\n";
+    if (metal_error.max_abs > kMetalFloatMaxAbsGate || metal_error.rmse > kMetalFloatRmseGate)
+        throw std::runtime_error("bench metal float stats exceeded the reduction gate");
 }
 
 } // namespace
@@ -331,6 +415,7 @@ int main(int argc, char ** argv) {
         if (!log_path.empty())
             engine::debug::configure_logging({true, log_path});
         check_exec();
+        check_metal_float_rows();
         engine::core::BackendConfig config;
         config.type = backend;
         config.threads = 2;
@@ -348,6 +433,28 @@ int main(int argc, char ** argv) {
         check_motion_rejection(fused, execution);
         check_threads(execution);
         check_portrait_sensitivity(execution);
+        for (const float strength : {0.37F, 1.F}) {
+            check_metal_float_color(graph, 1, 1, strength, 3, "edge");
+            check_metal_float_color(graph, 5, 7, strength, 4, "edge");
+            check_metal_float_color(graph, 8, 8, strength, 5, "edge");
+            check_metal_float_color(graph, 16, 12, strength, 6, "edge");
+        }
+        {
+            const int64_t height = 8, width = 8;
+            std::vector<float> video(static_cast<size_t>(3 * 33 * height * width), 0.2F);
+            std::vector<float> portrait(static_cast<size_t>(3 * height * width), -0.15F);
+            const auto & graph_host = graph.match(video, portrait, height, width, 1.F);
+            std::vector<float> fused(video.size());
+            fh::ColorReferenceCache cache;
+            fh::ColorFusedTiming timing;
+            fh::color_fused_apply_cpu(video.data(), portrait.data(), height, width, 0, 33, 0, 1.F, 1, cache,
+                fused.data(), nullptr, timing, fh::ColorFusedReduction::MetalFloat);
+            const auto error = compare(fused, graph_host);
+            std::cout << "metal-f32 constant 8x8 max_abs=" << error.max_abs << " rmse=" << error.rmse
+                      << " rgb8_mismatch=" << error.rgb8_mismatch << '\n';
+            if (error.max_abs > kMetalFloatMaxAbsGate || error.rmse > kMetalFloatRmseGate)
+                throw std::runtime_error("constant frame metal float reduction exceeded its gate");
+        }
         for (const float strength : {0.F, 0.37F, 1.F}) {
             check_shape(execution, graph, fused, 1, 1, strength);
             check_shape(execution, graph, fused, 5, 7, strength);

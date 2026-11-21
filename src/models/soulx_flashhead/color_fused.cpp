@@ -153,6 +153,36 @@ size_t pixel_index(int64_t frames, int64_t height, int64_t width, int64_t c, int
     return static_cast<size_t>(((c * frames + t) * height * width) + p);
 }
 
+float kahan_add(float sum, float & comp, float value) {
+    // Separate IEEE adds. volatile stops the host compiler from contracting
+    // (value - comp) + sum into an fma, which the Metal kernel does not do
+    // when fast math is disabled.
+    volatile float y = value - comp;
+    volatile float t = sum + y;
+    volatile float recovered = t - sum;
+    comp = recovered - y;
+    return t;
+}
+
+void two_sum(float a, float b, float & sum, float & error) {
+    // Knuth/Dekker exact sum of two floats. Same expression sequence as the shader.
+    volatile float s = a + b;
+    volatile float b_virtual = s - a;
+    volatile float a_virtual = s - b_virtual;
+    error = (a - a_virtual) + (b - b_virtual);
+    sum = s;
+}
+
+void channel_stats_metal_f32(const float * lab, int64_t frames, int64_t pixels, float * mean, float * stddev) {
+    for (int64_t frame = 0; frame < frames; ++frame) {
+        for (int channel = 0; channel < 3; ++channel) {
+            const auto row = color_fused_metal_f32_row(lab + static_cast<size_t>((frame * 3 + channel) * pixels), pixels);
+            mean[frame * 3 + channel] = row.mean;
+            stddev[frame * 3 + channel] = row.stddev;
+        }
+    }
+}
+
 void channel_stats(const float * lab, int64_t frames, int64_t pixels, float * mean, float * stddev) {
     // Match ggml_compute_forward_mean_f32: double sum, store as float, then
     // divide by float(count). One thread, raster order, so the reduction tree
@@ -177,9 +207,11 @@ void channel_stats(const float * lab, int64_t frames, int64_t pixels, float * me
 }
 
 void ensure_reference(const ColorMathConstants & k, const float * portrait, int64_t height, int64_t width, int threads,
-    ColorReferenceCache & cache, bool & cached, double & lab_ms) {
+    ColorReferenceCache & cache, bool & cached, double & lab_ms, ColorFusedReduction reduction) {
     const size_t count = static_cast<size_t>(3 * height * width);
-    const bool hit = cache.valid && cache.height == height && cache.width == width && cache.portrait.size() == count &&
+    const bool metal_float = reduction == ColorFusedReduction::MetalFloat;
+    const bool hit = cache.valid && cache.metal_float == metal_float && cache.height == height && cache.width == width &&
+                     cache.portrait.size() == count &&
                      std::memcmp(cache.portrait.data(), portrait, count * sizeof(float)) == 0;
     cached = hit;
     if (hit)
@@ -205,12 +237,16 @@ void ensure_reference(const ColorMathConstants & k, const float * portrait, int6
     // channel_stats expects [frame][channel][pixel]. One frame is already that
     // layout when channels are planar blocks of `pixels`.
     float mean[3], stddev[3];
-    channel_stats(lab.data(), 1, pixels, mean, stddev);
+    if (metal_float)
+        channel_stats_metal_f32(lab.data(), 1, pixels, mean, stddev);
+    else
+        channel_stats(lab.data(), 1, pixels, mean, stddev);
     cache.portrait.assign(portrait, portrait + count);
     cache.height = height;
     cache.width = width;
     std::copy(mean, mean + 3, cache.mean);
     std::copy(stddev, stddev + 3, cache.stddev);
+    cache.metal_float = metal_float;
     cache.valid = true;
     lab_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
 }
@@ -225,6 +261,50 @@ void copy_window(const float * src, float * dst, int64_t src_frames, int64_t dst
 }
 
 } // namespace
+
+MetalFloatRowStats color_fused_metal_f32_row(const float * row, int64_t pixels) {
+    if (pixels <= 0)
+        throw std::runtime_error("FlashHead Metal float stats require a positive row");
+    auto reduce_pairs = [](float * hi, float * lo) {
+        for (int stride = kMetalStatsLanes / 2; stride > 0; stride >>= 1) {
+            for (int lane = 0; lane < stride; ++lane) {
+                float sum = 0.F;
+                float error = 0.F;
+                two_sum(hi[lane], hi[lane + stride], sum, error);
+                const float low = (lo[lane] + lo[lane + stride]) + error;
+                two_sum(sum, low, hi[lane], lo[lane]);
+            }
+        }
+    };
+    float hi[kMetalStatsLanes];
+    float lo[kMetalStatsLanes];
+    for (int lane = 0; lane < kMetalStatsLanes; ++lane) {
+        float sum = 0.F;
+        float comp = 0.F;
+        for (int64_t p = lane; p < pixels; p += kMetalStatsLanes)
+            sum = kahan_add(sum, comp, row[p]);
+        hi[lane] = sum;
+        lo[lane] = -comp;
+    }
+    reduce_pairs(hi, lo);
+    const float mean = (hi[0] + lo[0]) / static_cast<float>(pixels);
+    for (int lane = 0; lane < kMetalStatsLanes; ++lane) {
+        float sum = 0.F;
+        float comp = 0.F;
+        for (int64_t p = lane; p < pixels; p += kMetalStatsLanes) {
+            const float delta = row[p] - mean;
+            sum = kahan_add(sum, comp, delta * delta);
+        }
+        hi[lane] = sum;
+        lo[lane] = -comp;
+    }
+    reduce_pairs(hi, lo);
+    MetalFloatRowStats stats;
+    stats.mean = mean;
+    const float variance = std::max(0.F, (hi[0] + lo[0]) / static_cast<float>(pixels));
+    stats.stddev = sqrtf(variance);
+    return stats;
+}
 
 void color_fused_channel_stats(const float * lab, int64_t frames, int64_t pixels, float * mean, float * stddev) {
     channel_stats(lab, frames, pixels, mean, stddev);
@@ -289,7 +369,8 @@ bool color_fused_metal_compiled() {
 
 void color_fused_apply_cpu(const float * video, const float * portrait, int64_t height, int64_t width,
     int64_t frame_begin, int64_t frame_count, int64_t motion_frames, float strength, int threads,
-    ColorReferenceCache & cache, float * video_out, float * motion_out, ColorFusedTiming & timing) {
+    ColorReferenceCache & cache, float * video_out, float * motion_out, ColorFusedTiming & timing,
+    ColorFusedReduction reduction) {
     const auto wall = std::chrono::steady_clock::now();
     timing = {};
     timing.backend = "cpu";
@@ -307,7 +388,7 @@ void color_fused_apply_cpu(const float * video, const float * portrait, int64_t 
     }
     const auto & k = color_math_constants();
     threads = std::max(1, threads);
-    ensure_reference(k, portrait, height, width, threads, cache, timing.reference_cached, timing.lab_ms);
+    ensure_reference(k, portrait, height, width, threads, cache, timing.reference_cached, timing.lab_ms, reduction);
     const int64_t pixels = height * width;
     std::vector<float> lab(static_cast<size_t>(frame_count * 3 * pixels));
     const auto lab_started = std::chrono::steady_clock::now();
@@ -334,7 +415,10 @@ void color_fused_apply_cpu(const float * video, const float * portrait, int64_t 
     // loop above stored [frame][pixel] with channel planes, which is the same
     // [frame][channel][pixel] order: channel c of frame f is at f*3*pixels + c*pixels.
     const auto stats_started = std::chrono::steady_clock::now();
-    channel_stats(lab.data(), frame_count, pixels, mean.data(), stddev.data());
+    if (reduction == ColorFusedReduction::MetalFloat)
+        channel_stats_metal_f32(lab.data(), frame_count, pixels, mean.data(), stddev.data());
+    else
+        channel_stats(lab.data(), frame_count, pixels, mean.data(), stddev.data());
     std::vector<float> ratio(static_cast<size_t>(frame_count * 3));
     for (int64_t f = 0; f < frame_count; ++f) {
         for (int c = 0; c < 3; ++c) {
@@ -375,7 +459,10 @@ void color_fused_apply_cpu(const float * video, const float * portrait, int64_t 
     });
     timing.match_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - match_started).count();
     timing.wall_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wall).count();
-    debug::timing_log_scalar("soulx_flashhead.color.impl", std::string_view("fused_cpu"));
+    debug::timing_log_scalar("soulx_flashhead.color.impl",
+        std::string_view(reduction == ColorFusedReduction::MetalFloat ? "fused_cpu_metal_f32_stats" : "fused_cpu"));
+    debug::timing_log_scalar("soulx_flashhead.color.reduction",
+        std::string_view(reduction == ColorFusedReduction::MetalFloat ? "metal_f32" : "double"));
     debug::timing_log_scalar("soulx_flashhead.color.lab_ms", timing.lab_ms);
     debug::timing_log_scalar("soulx_flashhead.color.stats_ms", timing.stats_ms);
     debug::timing_log_scalar("soulx_flashhead.color.match_ms", timing.match_ms);

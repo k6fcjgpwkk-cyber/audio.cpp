@@ -215,6 +215,35 @@ per-frame mean and standard deviation, then the strength blend):
 with `ENGINE_ENABLE_METAL=ON`. Omit the field, or set `"impl":"graph"`, to roll
 back. No other request option changes.
 
+### CPU and Metal precision
+
+Metal Shading Language 4.1, section 2.1, does not include `double`, `long double`,
+or any 64-bit floating-point type. The fused Metal shader uses `float` only.
+The host compiles it with fast math disabled (`MTLCompileOptions.fastMathEnabled
+= NO`, and `mathMode = Safe` on macOS 15 and later). Fast math is the MSL default
+and may reassociate additions (specification section 1.6.3), which would change
+the compensated sum.
+
+The CPU fused path still reduces each Lab row with a double sum, matching
+`ggml_mean` on CPU. That path was bitwise identical to the graph in the CPU run
+below. The Metal stats kernel does not call that routine and does not read the
+Lab image back to the host. Each row is reduced on the GPU by 256 Kahan lanes,
+the lane residual is kept, and the lanes are combined with Knuth two-sum. The
+same sequence is `color_fused_metal_f32_row`. A CPU run of that replica against
+the double graph was bitwise identical on the test images, including constant
+frames and a 5×7 frame. A 384² row of random values in about [-40, 40] differed
+in the mean by `3.7e-9` and matched the double standard deviation. Full frames
+using that reduction and the host per-pixel math differed from the graph by
+max abs `4.6e-6` at 128 (RMSE `1.1e-8`, no 8-bit mismatches) and by max abs 0
+at 384 and 512. Per-pixel
+`log`, `exp`, and `sqrt` in the shader are MSL functions. Their difference from
+host libm was not measured, because this host has no `metal` compiler and no
+Metal device.
+
+This host cannot compile the shader. `metal` and `xcrun` are absent. The shader
+source was checked by reading it: the embedded MSL uses `float` and does not
+declare a 64-bit float. That is not a GPU execution.
+
 Stage timings are written to the normal timing log when logging is enabled:
 
 | Key | Meaning |
@@ -289,10 +318,11 @@ scripts/build_metal.sh --deployment-build --model-set custom --models soulx_flas
 `--backend metal` compares the Metal graph with the fused Metal kernel on the
 same synthetic frames (33 input frames, motion tail 9, so 24 delivered frames
 at 384 or 512). The process prints max absolute error, RMSE, 8-bit mismatch
-count, and warm graph versus fused milliseconds. It exits non-zero if the float
-error exceeds the CPU gate above. That gate is intentionally tight for a first
-Mac run: a failure means the shader disagrees with the graph and the fused path
-must stay off. It is not evidence of a speedup.
+count, and warm graph versus fused milliseconds. It exits non-zero if the error
+exceeds max abs `1e-4` and RMSE `2e-5`. That check has not been run. A miss is
+a reason to leave `color.impl` at `graph`. Passing it would still not be a
+speedup measurement. MSL `log`, `exp`, and `sqrt` can differ from the CPU replica
+even when the reduction matches.
 
 A full Lite chunk still has to be timed with the GGUF, because this test does
 not run the VAE or DiT:

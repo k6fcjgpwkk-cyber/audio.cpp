@@ -63,6 +63,8 @@ struct ColorReferenceCache {
     float mean[3] = {};
     float stddev[3] = {};
     bool valid = false;
+    // True when mean/stddev came from the Metal float reduction.
+    bool metal_float = false;
 };
 
 struct ColorFusedDeviceBuffers {
@@ -73,21 +75,45 @@ struct ColorFusedDeviceBuffers {
     ggml_tensor * lab = nullptr;
     ggml_tensor * portrait = nullptr;
     ggml_tensor * portrait_lab = nullptr;
+    // Metal stats kernels write mean[frames*3] then stddev[frames*3]. The host
+    // does not reduce those rows.
+    ggml_tensor * stats = nullptr;
+    ggml_tensor * portrait_stats = nullptr;
 };
+
+// Lane count of flashhead_color_stats. The CPU replica and the MSL kernel must
+// use the same value. MSL has no double (specification 4.1, section 2.1).
+constexpr int kMetalStatsLanes = 256;
+
+enum class ColorFusedReduction {
+    // Double accumulation, then store the mean as float. Matches CPU ggml_mean.
+    Double,
+    // 256-lane Kahan sum and a float tree. This is the Metal stats kernel.
+    MetalFloat,
+};
+
+struct MetalFloatRowStats {
+    float mean = 0;
+    float stddev = 0;
+};
+
+// One Lab row, length pixels, in the order the stats kernel reads it.
+MetalFloatRowStats color_fused_metal_f32_row(const float * row, int64_t pixels);
 
 const ColorMathConstants & color_math_constants();
 bool color_fused_metal_compiled();
 
-// lab is [frame][channel][pixel], channel-major within the frame. Reduction matches
-// ggml's CPU mean: double accumulation, stored as float, divided by float(count).
+// lab is [frame][channel][pixel]. Double accumulation matches CPU ggml_mean.
 void color_fused_channel_stats(const float * lab, int64_t frames, int64_t pixels, float * mean, float * stddev);
 
 // video is logical {3, 33, height, width} in contiguous ggml order.
 // frame_begin/frame_count select the delivered window. motion_out may be null
 // when motion_frames is 0. motion_frames is the tail of the delivered window.
+// MetalFloat uses the reduction the shader runs. It is not a GPU execution.
 void color_fused_apply_cpu(const float * video, const float * portrait, int64_t height, int64_t width,
     int64_t frame_begin, int64_t frame_count, int64_t motion_frames, float strength, int threads,
-    ColorReferenceCache & cache, float * video_out, float * motion_out, ColorFusedTiming & timing);
+    ColorReferenceCache & cache, float * video_out, float * motion_out, ColorFusedTiming & timing,
+    ColorFusedReduction reduction = ColorFusedReduction::Double);
 
 // Returns false when this backend has no fused implementation in the binary.
 bool color_fused_execute_device(core::ExecutionContext & execution, const ColorFusedDeviceBuffers & buffers,

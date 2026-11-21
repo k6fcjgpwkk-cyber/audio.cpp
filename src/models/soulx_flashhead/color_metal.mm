@@ -56,7 +56,9 @@ enum Constant {
     kStrength = 49,
     kInverse = 50,
     kRefMean = 51,
-    kConstantCount = 54,
+    kRefStd = 54,
+    kStdFloor = 57,
+    kConstantCount = 58,
 };
 
 enum Uniform {
@@ -79,6 +81,12 @@ enum Uniform {
 constexpr const char * kShader = R"msl(
 #include <metal_stdlib>
 using namespace metal;
+// MSL 4.1 section 2.1: the language has no double, long double, or 64-bit float.
+// Every value in this shader is float (32-bit). The host must compile it with
+// fast math disabled. Fast math reassociates adds and contracts them into fma,
+// which would change the Kahan compensation below (MSL spec 1.6.3).
+// flashhead_color_stats matches color_fused_metal_f32_row: 256 lanes, Kahan in
+// increasing index order, fold sum-comp, then a float tree of strides 128..1.
 
 inline float mad(float x, float s, float b) { return fma(x, s, b); }
 inline float clampf(float x, float lo, float hi) { return x < lo ? lo : (x > hi ? hi : x); }
@@ -174,6 +182,96 @@ kernel void flashhead_color_lab(
     lab[(f * 3u + 2u) * pixels + p] = b;
 }
 
+inline float kahan_add(thread float & sum, thread float & comp, float value) {
+    float y = value - comp;
+    float t = sum + y;
+    float recovered = t - sum;
+    comp = recovered - y;
+    sum = t;
+    return sum;
+}
+
+struct FloatPair { float sum; float error; };
+inline FloatPair two_sum(float a, float b) {
+    // Returns the exact sum of two floats. A struct avoids taking a thread
+    // reference to threadgroup memory, which MSL rejects.
+    float s = a + b;
+    float b_virtual = s - a;
+    float a_virtual = s - b_virtual;
+    FloatPair out;
+    out.sum = s;
+    out.error = (a - a_virtual) + (b - b_virtual);
+    return out;
+}
+
+kernel void flashhead_color_stats(
+        device const float * lab_base [[buffer(0)]],
+        device float * stats_base [[buffer(1)]],
+        constant uint * u [[buffer(2)]],
+        uint tid [[thread_index_in_threadgroup]],
+        uint tg [[threadgroup_position_in_grid]]) {
+    uint pixels = u[0];
+    uint frames = u[1];
+    // The host dispatches exactly frames*3 groups of 256 threads, so every
+    // thread in the group reaches the barriers below.
+    uint f = tg / 3u;
+    uint c = tg - f * 3u;
+    threadgroup float hi[256];
+    threadgroup float lo[256];
+    threadgroup float mean_shared;
+    device const float * lab = shifted(lab_base, u, 2, 3);
+    device const float * row = lab + ((f * 3u + c) * pixels);
+    float sum = 0.0f;
+    float comp = 0.0f;
+    for (uint p = tid; p < pixels; p += 256u)
+        kahan_add(sum, comp, row[p]);
+    hi[tid] = sum;
+    lo[tid] = -comp;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            FloatPair merged = two_sum(hi[tid], hi[tid + stride]);
+            float low = (lo[tid] + lo[tid + stride]) + merged.error;
+            FloatPair renorm = two_sum(merged.sum, low);
+            hi[tid] = renorm.sum;
+            lo[tid] = renorm.error;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u)
+        mean_shared = (hi[0] + lo[0]) / float(pixels);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float mean = mean_shared;
+    sum = 0.0f;
+    comp = 0.0f;
+    for (uint p = tid; p < pixels; p += 256u) {
+        float delta = row[p] - mean;
+        kahan_add(sum, comp, delta * delta);
+    }
+    hi[tid] = sum;
+    lo[tid] = -comp;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            FloatPair merged = two_sum(hi[tid], hi[tid + stride]);
+            float low = (lo[tid] + lo[tid + stride]) + merged.error;
+            FloatPair renorm = two_sum(merged.sum, low);
+            hi[tid] = renorm.sum;
+            lo[tid] = renorm.error;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) {
+        device float * stats = shifted_rw(stats_base, u, 4, 5);
+        uint n = frames * 3u;
+        stats[f * 3u + c] = mean;
+        float variance = (hi[0] + lo[0]) / float(pixels);
+        if (variance < 0.0f)
+            variance = 0.0f;
+        stats[n + f * 3u + c] = sqrt(variance);
+    }
+}
+
 kernel void flashhead_color_match(
         device const float * src [[buffer(0)]],
         device const float * lab_base [[buffer(1)]],
@@ -181,7 +279,7 @@ kernel void flashhead_color_match(
         device float * motion_base [[buffer(3)]],
         constant uint * u [[buffer(4)]],
         constant float * k [[buffer(5)]],
-        constant float * stats [[buffer(6)]],
+        device const float * stats [[buffer(6)]],
         uint gid [[thread_position_in_grid]]) {
     uint pixels = u[5];
     uint frames = u[4];
@@ -197,8 +295,14 @@ kernel void flashhead_color_match(
     float corrected[3];
     for (uint c = 0; c < 3; ++c) {
         float value = lab[((f * 3u + c) * pixels) + p];
-        float centered = value - stats[f * 6u + c];
-        float scaled = centered * stats[f * 6u + 3u + c];
+        device const float * reduced = shifted(stats, u, 18, 19);
+        uint n = frames * 3u;
+        float mean = reduced[f * 3u + c];
+        float dev = reduced[n + f * 3u + c];
+        float safe = dev < k[57] ? 1.0f : dev;
+        float ratio = k[54 + c] / safe;
+        float centered = value - mean;
+        float scaled = centered * ratio;
         corrected[c] = scaled + k[51 + c];
     }
     float rr, gg, bb;
@@ -225,10 +329,13 @@ struct Pipelines {
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> queue = nil;
     id<MTLComputePipelineState> lab = nil;
+    id<MTLComputePipelineState> stats = nil;
     id<MTLComputePipelineState> match = nil;
     ~Pipelines() {
         if (match != nil)
             [match release];
+        if (stats != nil)
+            [stats release];
         if (lab != nil)
             [lab release];
         if (queue != nil)
@@ -240,10 +347,12 @@ struct Pipelines {
 
 Pipelines & pipelines_for(id<MTLDevice> device) {
     static Pipelines state;
-    if (state.device == device && state.lab != nil && state.match != nil)
+    if (state.device == device && state.lab != nil && state.stats != nil && state.match != nil)
         return state;
     if (state.match != nil)
         [state.match release];
+    if (state.stats != nil)
+        [state.stats release];
     if (state.lab != nil)
         [state.lab release];
     if (state.queue != nil)
@@ -256,7 +365,15 @@ Pipelines & pipelines_for(id<MTLDevice> device) {
     if (state.queue == nil)
         throw std::runtime_error("FlashHead fused color cannot create a Metal command queue");
     MTLCompileOptions * options = [[MTLCompileOptions alloc] init];
+    // MSL's default math mode is fast: it may reassociate and contract adds.
+    // The Kahan stats kernel needs the IEEE add/sub sequence. fastMathEnabled
+    // is the switch available since the first Metal SDK. mathMode=Safe is the
+    // same contract on macOS 15 and later (MSL spec 1.6.3).
     options.fastMathEnabled = NO;
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
+    if (@available(macOS 15.0, *))
+        options.mathMode = MTLMathModeSafe;
+#endif
     NSError * error = nil;
     id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:kShader] options:options error:&error];
     [options release];
@@ -265,17 +382,20 @@ Pipelines & pipelines_for(id<MTLDevice> device) {
         throw std::runtime_error(std::string("FlashHead fused color Metal compile failed: ") + message);
     }
     id<MTLFunction> lab = [library newFunctionWithName:@"flashhead_color_lab"];
+    id<MTLFunction> stats = [library newFunctionWithName:@"flashhead_color_stats"];
     id<MTLFunction> match = [library newFunctionWithName:@"flashhead_color_match"];
-    if (lab == nil || match == nil) {
+    if (lab == nil || stats == nil || match == nil) {
         [library release];
         throw std::runtime_error("FlashHead fused color Metal shader is missing a kernel");
     }
     state.lab = [device newComputePipelineStateWithFunction:lab error:&error];
+    state.stats = [device newComputePipelineStateWithFunction:stats error:&error];
     state.match = [device newComputePipelineStateWithFunction:match error:&error];
     [lab release];
+    [stats release];
     [match release];
     [library release];
-    if (state.lab == nil || state.match == nil) {
+    if (state.lab == nil || state.stats == nil || state.match == nil) {
         const char * message = error != nil ? [[error localizedDescription] UTF8String] : "unknown pipeline error";
         throw std::runtime_error(std::string("FlashHead fused color Metal pipeline failed: ") + message);
     }
@@ -345,15 +465,20 @@ void fill_constants(float * dst, float strength) {
     dst[kEncLin] = k.enc_lin_scale;
     dst[kStrength] = strength;
     dst[kInverse] = fmaf(strength, -1.F, 1.F);
-    std::memcpy(dst + kRefMean, k.white, sizeof(float)); // overwritten by the caller for match
+    dst[kStdFloor] = k.std_floor;
 }
 
-const float * device_or_copy(const ggml_tensor * tensor, bool shared, std::vector<float> & copy) {
-    if (shared && tensor->data != nullptr)
-        return static_cast<const float *>(tensor->data);
-    copy.resize(static_cast<size_t>(ggml_nelements(tensor)));
-    ggml_backend_tensor_get(tensor, copy.data(), 0, copy.size() * sizeof(float));
-    return copy.data();
+void encode_stats(id<MTLCommandBuffer> command, id<MTLComputePipelineState> pipeline, id<MTLBuffer> lab_buffer,
+    id<MTLBuffer> stats_buffer, const uint32_t * uniform, NSUInteger uniform_bytes, NSUInteger groups) {
+    if ([pipeline maxTotalThreadsPerThreadgroup] < 256)
+        throw std::runtime_error("FlashHead fused color stats kernel requires 256 threads in a group");
+    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:lab_buffer offset:0 atIndex:0];
+    [encoder setBuffer:stats_buffer offset:0 atIndex:1];
+    [encoder setBytes:uniform length:uniform_bytes atIndex:2];
+    [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [encoder endEncoding];
 }
 
 } // namespace
@@ -362,7 +487,7 @@ bool color_fused_metal_apply(core::ExecutionContext & execution, const ColorFuse
     const float * portrait, int64_t height, int64_t width, int64_t frame_begin, int64_t frame_count,
     int64_t motion_frames, float strength, ColorReferenceCache & cache) {
     if (buffers.lab == nullptr || buffers.portrait == nullptr || buffers.portrait_lab == nullptr ||
-        buffers.motion_out == nullptr)
+        buffers.motion_out == nullptr || buffers.stats == nullptr || buffers.portrait_stats == nullptr)
         throw std::runtime_error("FlashHead fused color Metal scratch buffers were not allocated");
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
@@ -374,16 +499,16 @@ bool color_fused_metal_apply(core::ExecutionContext & execution, const ColorFuse
     const Binding portrait_lab = bind_tensor(buffers.portrait_lab, "portrait lab");
     const Binding output = bind_tensor(buffers.video_out, "output");
     const Binding motion = bind_tensor(buffers.motion_out, "motion");
+    const Binding stats = bind_tensor(buffers.stats, "stats");
+    const Binding portrait_stats = bind_tensor(buffers.portrait_stats, "portrait stats");
     if (video.buffer.device != lab.buffer.device)
         throw std::runtime_error("FlashHead fused color Metal buffers are on different devices");
     Pipelines & pipes = pipelines_for(video.buffer.device);
-    const bool shared = ggml_metal_buffer_is_shared(
-        static_cast<ggml_metal_buffer_t>((buffers.lab->view_src ? buffers.lab->view_src->buffer : buffers.lab->buffer)->context));
     float constants[kConstantCount];
     fill_constants(constants, strength);
     const int64_t pixels = height * width;
     const size_t portrait_bytes = static_cast<size_t>(3 * pixels) * sizeof(float);
-    const bool reference_cached = cache.valid && cache.height == height && cache.width == width &&
+    const bool reference_cached = cache.valid && cache.metal_float && cache.height == height && cache.width == width &&
                                   cache.portrait.size() == static_cast<size_t>(3 * pixels) &&
                                   std::memcmp(cache.portrait.data(), portrait, portrait_bytes) == 0;
     double lab_ms = 0;
@@ -419,14 +544,29 @@ bool color_fused_metal_apply(core::ExecutionContext & execution, const ColorFuse
             if ([command status] != MTLCommandBufferStatusCompleted)
                 throw std::runtime_error("FlashHead fused color reference Lab dispatch failed");
         }
+        uint32_t stats_uniform[6] = {};
+        stats_uniform[0] = static_cast<uint32_t>(pixels);
+        stats_uniform[1] = 1;
+        put_offset(stats_uniform, 2, 3, portrait_lab.offset);
+        put_offset(stats_uniform, 4, 5, portrait_stats.offset);
+        const auto stats_started = std::chrono::steady_clock::now();
+        @autoreleasepool {
+            id<MTLCommandBuffer> command = [pipes.queue commandBuffer];
+            encode_stats(command, pipes.stats, portrait_lab.buffer, portrait_stats.buffer, stats_uniform,
+                sizeof(stats_uniform), 3);
+            [command commit];
+            [command waitUntilCompleted];
+            if ([command status] != MTLCommandBufferStatusCompleted)
+                throw std::runtime_error("FlashHead fused color reference stats dispatch failed");
+        }
         lab_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
-        std::vector<float> copy;
-        const float * lab_ptr = device_or_copy(buffers.portrait_lab, shared, copy);
-        float mean[3], stddev[3];
-        color_fused_channel_stats(lab_ptr, 1, pixels, mean, stddev);
-        std::memcpy(cache.mean, mean, sizeof(mean));
-        std::memcpy(cache.stddev, stddev, sizeof(stddev));
+        float reduced[6];
+        ggml_backend_tensor_get(buffers.portrait_stats, reduced, 0, sizeof(reduced));
+        std::memcpy(cache.mean, reduced, sizeof(float) * 3);
+        std::memcpy(cache.stddev, reduced + 3, sizeof(float) * 3);
+        cache.metal_float = true;
         cache.valid = true;
+        (void)stats_started;
     }
     uint32_t uniform[20] = {};
     uniform[kWidth] = static_cast<uint32_t>(width);
@@ -457,24 +597,24 @@ bool color_fused_metal_apply(core::ExecutionContext & execution, const ColorFuse
             throw std::runtime_error("FlashHead fused color video Lab dispatch failed");
     }
     lab_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lab_started).count();
-    std::vector<float> lab_copy;
-    const float * lab_ptr = device_or_copy(buffers.lab, shared, lab_copy);
-    std::vector<float> mean(static_cast<size_t>(frame_count * 3));
-    std::vector<float> stddev(static_cast<size_t>(frame_count * 3));
+    uint32_t stats_uniform[6] = {};
+    stats_uniform[0] = static_cast<uint32_t>(pixels);
+    stats_uniform[1] = static_cast<uint32_t>(frame_count);
+    put_offset(stats_uniform, 2, 3, lab.offset);
+    put_offset(stats_uniform, 4, 5, stats.offset);
     const auto stats_started = std::chrono::steady_clock::now();
-    color_fused_channel_stats(lab_ptr, frame_count, pixels, mean.data(), stddev.data());
-    std::vector<float> stats(static_cast<size_t>(frame_count * 6));
-    const float floor = color_math_constants().std_floor;
-    for (int64_t f = 0; f < frame_count; ++f) {
-        for (int c = 0; c < 3; ++c) {
-            const float dev = stddev[static_cast<size_t>(f * 3 + c)];
-            const float safe = dev < floor ? 1.F : dev;
-            stats[static_cast<size_t>(f * 6 + c)] = mean[static_cast<size_t>(f * 3 + c)];
-            stats[static_cast<size_t>(f * 6 + 3 + c)] = cache.stddev[c] / safe;
-        }
+    @autoreleasepool {
+        id<MTLCommandBuffer> command = [pipes.queue commandBuffer];
+        encode_stats(command, pipes.stats, lab.buffer, stats.buffer, stats_uniform, sizeof(stats_uniform),
+            static_cast<NSUInteger>(frame_count * 3));
+        [command commit];
+        [command waitUntilCompleted];
+        if ([command status] != MTLCommandBufferStatusCompleted)
+            throw std::runtime_error("FlashHead fused color stats dispatch failed");
     }
     const double stats_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stats_started).count();
     std::memcpy(constants + kRefMean, cache.mean, sizeof(float) * 3);
+    std::memcpy(constants + kRefStd, cache.stddev, sizeof(float) * 3);
     uint32_t match_uniform[20] = {};
     match_uniform[kWidth] = static_cast<uint32_t>(width);
     match_uniform[kHeight] = static_cast<uint32_t>(height);
@@ -486,6 +626,7 @@ bool color_fused_metal_apply(core::ExecutionContext & execution, const ColorFuse
     put_offset(match_uniform, kDstLo, kDstHi, lab.offset);
     put_offset(match_uniform, 14, 15, output.offset);
     put_offset(match_uniform, 16, 17, motion.offset);
+    put_offset(match_uniform, 18, 19, stats.offset);
     match_uniform[kMotionFrames] = static_cast<uint32_t>(motion_frames);
     const auto match_started = std::chrono::steady_clock::now();
     @autoreleasepool {
@@ -498,7 +639,7 @@ bool color_fused_metal_apply(core::ExecutionContext & execution, const ColorFuse
         [encoder setBuffer:motion.buffer offset:0 atIndex:3];
         [encoder setBytes:match_uniform length:sizeof(match_uniform) atIndex:4];
         [encoder setBytes:constants length:sizeof(constants) atIndex:5];
-        [encoder setBytes:stats.data() length:stats.size() * sizeof(float) atIndex:6];
+        [encoder setBuffer:stats.buffer offset:0 atIndex:6];
         NSUInteger width_threads = std::max<NSUInteger>(1, std::min<NSUInteger>(256, [pipes.match maxTotalThreadsPerThreadgroup]));
         const NSUInteger count = static_cast<NSUInteger>(frame_count * pixels);
         NSUInteger groups = (count + width_threads - 1) / width_threads;
@@ -513,6 +654,7 @@ bool color_fused_metal_apply(core::ExecutionContext & execution, const ColorFuse
     ggml_backend_synchronize(execution.backend());
     const double wall_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wall).count();
     debug::timing_log_scalar("soulx_flashhead.color.impl", std::string_view("fused_metal"));
+    debug::timing_log_scalar("soulx_flashhead.color.reduction", std::string_view("metal_f32"));
     debug::timing_log_scalar("soulx_flashhead.color.lab_ms", lab_ms);
     debug::timing_log_scalar("soulx_flashhead.color.stats_ms", stats_ms);
     debug::timing_log_scalar("soulx_flashhead.color.match_ms", match_ms);

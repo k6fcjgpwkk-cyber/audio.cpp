@@ -1483,6 +1483,8 @@ if (TARGET engine_model_soulx_flashhead)
     target_link_libraries(soulx_flashhead_session_test PRIVATE engine_runtime ggml)
     add_executable(soulx_flashhead_color_opt_test EXCLUDE_FROM_ALL tests/soulx_flashhead/color_opt_test.cpp)
     target_link_libraries(soulx_flashhead_color_opt_test PRIVATE engine_runtime ggml)
+    target_include_directories(soulx_flashhead_color_opt_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/models/soulx_flashhead")
     if (APPLE AND ENGINE_ENABLE_METAL)
         target_sources(engine_model_soulx_flashhead PRIVATE src/models/soulx_flashhead/color_metal.mm)
         target_compile_definitions(engine_model_soulx_flashhead PRIVATE SOULX_FLASHHEAD_COLOR_METAL=1)
